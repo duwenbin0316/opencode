@@ -1,0 +1,25 @@
+packages/opencode/src/cli/cmd/tui/component/prompt/index.tsx
+  cb950138a26a2297 647-660
+packages/opencode/src/cli/cmd/tui/routes/session/index.tsx
+  cb950138a26a2297 28,31,674-714,1631-1939
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "53d5704f71ffa3692d55c58be9997b98e6238153",
+  "prompts": {
+    "cb950138a26a2297": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019dce79-c150-7ec2-871e-bb412054d0cf",
+        "model": "gpt-5.5"
+      },
+      "human_author": "杜文斌",
+      "messages": [],
+      "total_additions": 367,
+      "total_deletions": 0,
+      "accepted_lines": 367,
+      "overriden_lines": 0
+    }
+  }
+}
