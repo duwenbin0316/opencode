@@ -644,6 +644,20 @@ export function Prompt(props: PromptProps) {
       void exit()
       return true
     }
+    const slash = command.slashes().find((item) => {
+      const name = trimmed.split(/\s+/)[0]
+      return item.display === name || item.aliases?.includes(name)
+    })
+    if (slash) {
+      slash.onSelect()
+      input.clear()
+      setStore("prompt", {
+        input: "",
+        parts: [],
+      })
+      setStore("extmarkToPartIndex", new Map())
+      return true
+    }
     const selectedModel = local.model.current()
     if (!selectedModel) {
       void promptModelWarning()

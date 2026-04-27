@@ -25,8 +25,10 @@ import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, 
 import { Prompt, type PromptRef } from "@tui/component/prompt"
 import type {
   AssistantMessage,
+  Message,
   Part,
   Provider,
+  Session as SessionInfo,
   ToolPart,
   UserMessage,
   TextPart,
@@ -667,6 +669,47 @@ export function Session() {
       onSelect: (dialog) => {
         setShowGenericToolOutput((prev) => !prev)
         dialog.clear()
+      },
+    },
+    {
+      title: "Show project activity",
+      value: "session.activity",
+      category: "Session",
+      slash: {
+        name: "activity",
+        aliases: ["stats"],
+      },
+      onSelect: async (dialog) => {
+        const since = Date.now() - 7 * 24 * 60 * 60 * 1000
+        const sessionsResult = await sdk.client.session.list({ start: since, limit: 500 }).catch((error) => {
+          toast.show({
+            message: error instanceof Error ? error.message : "Failed to load project activity",
+            variant: "error",
+          })
+          return undefined
+        })
+        if (!sessionsResult) {
+          dialog.clear()
+          return
+        }
+        const messages = await Promise.all(
+          (sessionsResult.data ?? []).map((item) =>
+            sdk.client.session
+              .messages({ sessionID: item.id })
+              .then((result) => ({ session: item, messages: result.data ?? [] }))
+              .catch(() => ({ session: item, messages: [] })),
+          ),
+        )
+        dialog.setSize("large")
+        dialog.replace(() => (
+          <DialogProjectActivity
+            activity={createProjectActivity({
+              sessions: messages,
+              mcp: sync.data.mcp,
+              currentSessionID: route.sessionID,
+            })}
+          />
+        ))
       },
     },
     {
@@ -1584,6 +1627,316 @@ type ToolProps<T> = {
   tool: string
   output?: string
   part: ToolPart
+}
+
+type ActivityToolCall = {
+  type: "mcp" | "skill"
+  name: string
+  status: ToolPart["state"]["status"]
+  sessionID: string
+  time: number
+}
+
+type CodeActivity = {
+  files: Set<string>
+  additions: number
+  deletions: number
+}
+
+type ActivitySummary = {
+  sessions: number
+  messages: number
+  assistantMessages: number
+  code: CodeActivity
+  mcp: number
+  skills: number
+  tools: Record<string, number>
+  tokens: {
+    input: number
+    output: number
+    reasoning: number
+  }
+  cost: number
+}
+
+function sanitizeMcpToolName(value: string) {
+  return value.replace(/[^a-zA-Z0-9_-]/g, "_")
+}
+
+function lineCount(value?: string) {
+  if (!value) return 0
+  return value.split(/\r?\n/).length
+}
+
+function fileChange(input: unknown) {
+  if (!input || typeof input !== "object") return
+  const data = input as {
+    file?: unknown
+    filePath?: unknown
+    relativePath?: unknown
+    additions?: unknown
+    deletions?: unknown
+  }
+  return {
+    file:
+      typeof data.file === "string"
+        ? data.file
+        : typeof data.filePath === "string"
+          ? data.filePath
+          : typeof data.relativePath === "string"
+            ? data.relativePath
+            : undefined,
+    additions: typeof data.additions === "number" ? data.additions : 0,
+    deletions: typeof data.deletions === "number" ? data.deletions : 0,
+  }
+}
+
+function addFileChange(activity: CodeActivity, input: unknown) {
+  const change = fileChange(input)
+  if (!change) return
+  if (change.file) activity.files.add(change.file)
+  activity.additions += change.additions
+  activity.deletions += change.deletions
+}
+
+function addCodeActivity(activity: CodeActivity, part: ToolPart) {
+  if (part.state.status !== "completed") return
+  const input = part.state.input as { filePath?: unknown; content?: unknown } | undefined
+  const metadata = part.state.metadata as
+    | {
+        filediff?: unknown
+        files?: unknown
+        results?: unknown
+        filepath?: unknown
+      }
+    | undefined
+
+  if (part.tool === "write") {
+    if (typeof metadata?.filepath === "string") activity.files.add(metadata.filepath)
+    activity.additions += lineCount(typeof input?.content === "string" ? input.content : undefined)
+    return
+  }
+
+  if (part.tool === "edit") {
+    addFileChange(activity, metadata?.filediff)
+    return
+  }
+
+  if (part.tool === "apply_patch") {
+    if (Array.isArray(metadata?.files)) metadata.files.forEach((item) => addFileChange(activity, item))
+    return
+  }
+
+  if (part.tool === "multiedit") {
+    if (Array.isArray(metadata?.results)) {
+      metadata.results.forEach((item) => {
+        if (!item || typeof item !== "object") return
+        addFileChange(activity, (item as { filediff?: unknown }).filediff)
+      })
+    }
+  }
+}
+
+function createSummary(): ActivitySummary {
+  return {
+    sessions: 0,
+    messages: 0,
+    assistantMessages: 0,
+    code: { files: new Set(), additions: 0, deletions: 0 },
+    mcp: 0,
+    skills: 0,
+    tools: {},
+    tokens: {
+      input: 0,
+      output: 0,
+      reasoning: 0,
+    },
+    cost: 0,
+  }
+}
+
+function addToolCall(summary: ActivitySummary, part: ToolPart, mcpServers: { name: string; prefix: string }[]) {
+  summary.tools[part.tool] = (summary.tools[part.tool] ?? 0) + 1
+  if (mcpServers.some((server) => part.tool.startsWith(server.prefix))) summary.mcp++
+  if (part.tool === "skill") summary.skills++
+}
+
+function createProjectActivity(input: {
+  sessions: { session: SessionInfo; messages: { info: Message; parts: Part[] }[] }[]
+  mcp: Record<string, unknown>
+  currentSessionID: string
+}) {
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
+  const mcpServers = Object.keys(input.mcp).map((name) => ({
+    name,
+    prefix: sanitizeMcpToolName(name) + "_",
+  }))
+  const todaySummary = createSummary()
+  const sevenDaySummary = createSummary()
+  const calls: ActivityToolCall[] = []
+
+  input.sessions.forEach((entry) => {
+    if (entry.session.time.updated >= today.getTime()) todaySummary.sessions++
+    if (entry.session.time.updated >= sevenDaysAgo) sevenDaySummary.sessions++
+
+    entry.messages.forEach((message) => {
+      const time = message.info.role === "assistant" ? (message.info.time.completed ?? message.info.time.created) : message.info.time.created
+      const summaries = [
+        ...(time >= today.getTime() ? [todaySummary] : []),
+        ...(time >= sevenDaysAgo ? [sevenDaySummary] : []),
+      ]
+
+      summaries.forEach((summary) => {
+        summary.messages++
+        if (message.info.role === "assistant") {
+          summary.assistantMessages++
+          summary.cost += message.info.cost ?? 0
+          summary.tokens.input += message.info.tokens?.input ?? 0
+          summary.tokens.output += message.info.tokens?.output ?? 0
+          summary.tokens.reasoning += message.info.tokens?.reasoning ?? 0
+        }
+      })
+
+      if (message.info.role !== "assistant") return
+      message.parts.forEach((part) => {
+        if (part.type !== "tool") return
+        summaries.forEach((summary) => {
+          addToolCall(summary, part, mcpServers)
+          addCodeActivity(summary.code, part)
+        })
+        const mcpServer = mcpServers.find((server) => part.tool.startsWith(server.prefix))
+        if (mcpServer) {
+          calls.push({
+            type: "mcp",
+            name: `${mcpServer.name}:${part.tool.slice(mcpServer.prefix.length)}`,
+            status: part.state.status,
+            sessionID: entry.session.id,
+            time,
+          })
+        }
+        if (part.tool === "skill") {
+          const stateInput = part.state.input as { name?: unknown } | undefined
+          calls.push({
+            type: "skill",
+            name: typeof stateInput?.name === "string" ? stateInput.name : "unknown",
+            status: part.state.status,
+            sessionID: entry.session.id,
+            time,
+          })
+        }
+      })
+    })
+  })
+
+  return {
+    today: todaySummary,
+    sevenDays: sevenDaySummary,
+    currentSessionCalls: calls
+      .filter((call) => call.sessionID === input.currentSessionID)
+      .toSorted((a, b) => b.time - a.time),
+    recentCalls: calls.toSorted((a, b) => b.time - a.time).slice(0, 12),
+  }
+}
+
+function formatTime(time: number) {
+  return new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+}
+
+function formatNumber(value: number) {
+  return Math.round(value).toLocaleString()
+}
+
+function totalTokens(summary: ActivitySummary) {
+  return summary.tokens.input + summary.tokens.output + summary.tokens.reasoning
+}
+
+function SummaryBlock(props: { title: string; summary: ActivitySummary }) {
+  const { theme } = useTheme()
+  return (
+    <box gap={0}>
+      <text fg={theme.accent} attributes={TextAttributes.BOLD}>
+        {props.title}
+      </text>
+      <text fg={theme.text}>
+        Sessions {formatNumber(props.summary.sessions)} · Messages {formatNumber(props.summary.messages)} · Files{" "}
+        {formatNumber(props.summary.code.files.size)}
+      </text>
+      <text fg={theme.text}>
+        Code +{formatNumber(props.summary.code.additions)} / -{formatNumber(props.summary.code.deletions)} · MCP{" "}
+        {formatNumber(props.summary.mcp)} · Skill {formatNumber(props.summary.skills)}
+      </text>
+      <text fg={theme.textMuted}>
+        Tokens {formatNumber(totalTokens(props.summary))} · Cost ${props.summary.cost.toFixed(2)}
+      </text>
+    </box>
+  )
+}
+
+function DialogProjectActivity(props: { activity: ReturnType<typeof createProjectActivity> }) {
+  const dialog = useDialog()
+  const { theme } = useTheme()
+  const currentRows = createMemo(() => props.activity.currentSessionCalls.slice(0, 8))
+  const recentRows = createMemo(() => props.activity.recentCalls)
+
+  useKeyboard((evt) => {
+    if (evt.name !== "return") return
+    evt.preventDefault()
+    dialog.clear()
+  })
+
+  return (
+    <box paddingLeft={2} paddingRight={2} paddingBottom={1} gap={1}>
+      <box flexDirection="row" justifyContent="space-between">
+        <text attributes={TextAttributes.BOLD} fg={theme.text}>
+          Project Activity
+        </text>
+        <text fg={theme.textMuted} onMouseUp={() => dialog.clear()}>
+          esc
+        </text>
+      </box>
+      <SummaryBlock title="Today" summary={props.activity.today} />
+      <SummaryBlock title="Last 7 days" summary={props.activity.sevenDays} />
+      <box gap={0}>
+        <text fg={theme.accent} attributes={TextAttributes.BOLD}>
+          Current session MCP / Skill
+        </text>
+        <CallRows rows={currentRows()} empty="No MCP or skill calls in this session." />
+      </box>
+      <box gap={0}>
+        <text fg={theme.accent} attributes={TextAttributes.BOLD}>
+          Recent project MCP / Skill
+        </text>
+        <CallRows rows={recentRows()} empty="No MCP or skill calls in the last 7 days." />
+      </box>
+      <box flexDirection="row" justifyContent="flex-end">
+        <box paddingLeft={3} paddingRight={3} backgroundColor={theme.primary} onMouseUp={() => dialog.clear()}>
+          <text fg={theme.selectedListItemText}>ok</text>
+        </box>
+      </box>
+    </box>
+  )
+}
+
+function CallRows(props: { rows: ActivityToolCall[]; empty: string }) {
+  const { theme } = useTheme()
+  return (
+    <Show when={props.rows.length > 0} fallback={<text fg={theme.textMuted}>{props.empty}</text>}>
+      <box gap={0}>
+        <For each={props.rows}>
+          {(call) => (
+            <box flexDirection="row" gap={1}>
+              <text fg={theme.textMuted}>{formatTime(call.time)}</text>
+              <text fg={call.type === "mcp" ? theme.info : theme.success}>{call.type.toUpperCase()}</text>
+              <text fg={theme.text}>{call.name}</text>
+              <text fg={theme.textMuted}>({call.status})</text>
+            </box>
+          )}
+        </For>
+      </box>
+    </Show>
+  )
 }
 function GenericTool(props: ToolProps<any>) {
   const { theme } = useTheme()
