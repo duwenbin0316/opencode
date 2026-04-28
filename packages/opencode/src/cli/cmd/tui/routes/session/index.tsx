@@ -76,7 +76,7 @@ import * as Editor from "../../util/editor"
 import stripAnsi from "strip-ansi"
 import { usePromptRef } from "../../context/prompt"
 import { useExit } from "../../context/exit"
-import { Filesystem } from "@/util"
+import { Filesystem, Process } from "@/util"
 import { Global } from "@/global"
 import { PermissionPrompt } from "./permission"
 import { QuestionPrompt } from "./question"
@@ -710,6 +710,30 @@ export function Session() {
             })}
           />
         ))
+      },
+    },
+    {
+      title: "Show AI authorship stats",
+      value: "session.ai_stats",
+      category: "Session",
+      slash: {
+        name: "ai-stats",
+        aliases: ["authorship"],
+      },
+      onSelect: async (dialog) => {
+        const activity = await loadGitAiActivity(project.instance.directory()).catch((error) => {
+          toast.show({
+            message: error instanceof Error ? error.message : "Failed to load AI authorship stats",
+            variant: "error",
+          })
+          return undefined
+        })
+        if (!activity) {
+          dialog.clear()
+          return
+        }
+        dialog.setSize("large")
+        dialog.replace(() => <DialogGitAiActivity activity={activity} />)
       },
     },
     {
@@ -1659,6 +1683,27 @@ type ActivitySummary = {
   cost: number
 }
 
+type GitAiCommitStats = {
+  sha: string
+  short: string
+  title: string
+  human: number
+  mixed: number
+  ai: number
+  accepted: number
+  generated: number
+  additions: number
+  deletions: number
+  tools: { name: string; ai: number; accepted: number }[]
+}
+
+type GitAiActivity = {
+  commits: GitAiCommitStats[]
+  total: Omit<GitAiCommitStats, "sha" | "short" | "title" | "tools"> & {
+    tools: Record<string, { ai: number; accepted: number }>
+  }
+}
+
 function sanitizeMcpToolName(value: string) {
   return value.replace(/[^a-zA-Z0-9_-]/g, "_")
 }
@@ -1852,6 +1897,123 @@ function totalTokens(summary: ActivitySummary) {
   return summary.tokens.input + summary.tokens.output + summary.tokens.reasoning
 }
 
+function numberField(input: Record<string, unknown>, key: string) {
+  const value = input[key]
+  return typeof value === "number" && Number.isFinite(value) ? value : 0
+}
+
+function objectField(input: Record<string, unknown>, key: string) {
+  const value = input[key]
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined
+}
+
+function parseGitAiStats(input: string) {
+  const data = JSON.parse(input) as Record<string, unknown>
+  const diffStats = objectField(data, "commit_stats") ?? objectField(data, "range_stats")
+  const stats = diffStats ?? data
+  const prompts = objectField(data, "prompts")
+  const breakdown = stats.tool_model_breakdown
+  const ai = numberField(stats, "ai_lines_added") || numberField(stats, "ai_additions")
+  const additions = numberField(stats, "git_lines_added") || numberField(stats, "git_diff_added_lines")
+  return {
+    human: diffStats !== undefined ? Math.max(0, additions - ai) : numberField(stats, "human_additions"),
+    mixed: numberField(stats, "mixed_lines_added") || numberField(stats, "mixed_additions"),
+    ai,
+    accepted:
+      diffStats !== undefined
+        ? ai
+        : prompts === undefined
+        ? numberField(stats, "ai_accepted") || ai
+        : Object.values(prompts).reduce<number>((sum, value) => {
+            if (!value || typeof value !== "object") return sum
+            return sum + numberField(value as Record<string, unknown>, "accepted_lines")
+          }, 0),
+    generated: numberField(stats, "ai_lines_generated") || numberField(stats, "total_ai_additions"),
+    additions,
+    deletions: numberField(stats, "git_lines_deleted") || numberField(stats, "git_diff_deleted_lines"),
+    tools:
+      breakdown && typeof breakdown === "object"
+        ? Object.entries(breakdown as Record<string, unknown>)
+            .map(([name, value]) => {
+              if (!value || typeof value !== "object") return
+              const stats = value as Record<string, unknown>
+              return {
+                name,
+                ai: numberField(stats, "ai_lines_added") || numberField(stats, "ai_additions"),
+                accepted:
+                  numberField(stats, "ai_lines_added") ||
+                  numberField(stats, "ai_accepted") ||
+                  numberField(stats, "accepted_lines"),
+              }
+            })
+            .filter((item): item is { name: string; ai: number; accepted: number } => item !== undefined)
+            .toSorted((a, b) => b.ai - a.ai)
+        : [],
+  }
+}
+
+function parseGitCommitLine(input: string) {
+  const [sha, short, ...rest] = input.split("\t")
+  if (!sha || !short) return
+  return {
+    sha,
+    short,
+    title: rest.join("\t"),
+  }
+}
+
+async function loadGitAiActivity(cwd: string): Promise<GitAiActivity> {
+  const commits = (
+    await Process.lines(["git", "log", "--no-merges", "--format=%H%x09%h%x09%s", "-5"], {
+      cwd,
+    })
+  )
+    .map(parseGitCommitLine)
+    .filter((item): item is { sha: string; short: string; title: string } => item !== undefined)
+
+  const rows = await Promise.all(
+    commits.map(async (commit) => ({
+      ...commit,
+      ...parseGitAiStats((await Process.text(["git-ai", "diff", commit.sha, "--json", "--include-stats"], { cwd })).text),
+    })),
+  )
+  const total = rows.reduce<GitAiActivity["total"]>(
+    (acc, row) => {
+      row.tools.forEach((tool) => {
+        acc.tools[tool.name] = {
+          ai: (acc.tools[tool.name]?.ai ?? 0) + tool.ai,
+          accepted: (acc.tools[tool.name]?.accepted ?? 0) + tool.accepted,
+        }
+      })
+      return {
+        human: acc.human + row.human,
+        mixed: acc.mixed + row.mixed,
+        ai: acc.ai + row.ai,
+        accepted: acc.accepted + row.accepted,
+        generated: acc.generated + row.generated,
+        additions: acc.additions + row.additions,
+        deletions: acc.deletions + row.deletions,
+        tools: acc.tools,
+      }
+    },
+    {
+      human: 0,
+      mixed: 0,
+      ai: 0,
+      accepted: 0,
+      generated: 0,
+      additions: 0,
+      deletions: 0,
+      tools: {},
+    },
+  )
+
+  return {
+    commits: rows,
+    total,
+  }
+}
+
 function SummaryBlock(props: { title: string; summary: ActivitySummary }) {
   const { theme } = useTheme()
   return (
@@ -1870,6 +2032,94 @@ function SummaryBlock(props: { title: string; summary: ActivitySummary }) {
       <text fg={theme.textMuted}>
         Tokens {formatNumber(totalTokens(props.summary))} · Cost ${props.summary.cost.toFixed(2)}
       </text>
+    </box>
+  )
+}
+
+function DialogGitAiActivity(props: { activity: GitAiActivity }) {
+  const dialog = useDialog()
+  const { theme } = useTheme()
+  const tools = createMemo(() =>
+    Object.entries(props.activity.total.tools)
+      .map(([name, stats]) => ({ name, ...stats }))
+      .toSorted((a, b) => b.ai - a.ai)
+      .slice(0, 4),
+  )
+
+  useKeyboard((evt) => {
+    if (evt.name !== "return") return
+    evt.preventDefault()
+    dialog.clear()
+  })
+
+  return (
+    <box paddingLeft={2} paddingRight={2} paddingBottom={1} gap={1}>
+      <box flexDirection="row" justifyContent="space-between">
+        <text attributes={TextAttributes.BOLD} fg={theme.text}>
+          AI Authorship
+        </text>
+        <text fg={theme.textMuted} onMouseUp={() => dialog.clear()}>
+          esc
+        </text>
+      </box>
+      <box gap={0}>
+        <text fg={theme.accent} attributes={TextAttributes.BOLD}>
+          Last 5 commits
+        </text>
+        <text fg={theme.text}>
+          Human {formatNumber(props.activity.total.human)} · AI {formatNumber(props.activity.total.ai)}
+        </text>
+        <text fg={theme.textMuted}>
+          Mixed {formatNumber(props.activity.total.mixed)} · Kept {formatNumber(props.activity.total.accepted)} /
+          Generated {formatNumber(props.activity.total.generated)}
+        </text>
+        <text fg={theme.textMuted}>
+          Diff +{formatNumber(props.activity.total.additions)} / -{formatNumber(props.activity.total.deletions)}
+        </text>
+      </box>
+      <box gap={0}>
+        <text fg={theme.accent} attributes={TextAttributes.BOLD}>
+          Commits
+        </text>
+        <Show when={props.activity.commits.length > 0} fallback={<text fg={theme.textMuted}>No commits found.</text>}>
+          <box gap={0}>
+            <For each={props.activity.commits}>
+              {(commit) => (
+                <box gap={0}>
+                  <box flexDirection="row" gap={1}>
+                    <text fg={theme.textMuted}>{commit.short}</text>
+                    <text fg={theme.text}>{commit.title}</text>
+                  </box>
+                  <text fg={theme.textMuted}>
+                    Human {formatNumber(commit.human)} · AI {formatNumber(commit.ai)} · Mixed{" "}
+                    {formatNumber(commit.mixed)} · Diff +{formatNumber(commit.additions)} / -
+                    {formatNumber(commit.deletions)}
+                  </text>
+                </box>
+              )}
+            </For>
+          </box>
+        </Show>
+      </box>
+      <Show when={tools().length > 0}>
+        <box gap={0}>
+          <text fg={theme.accent} attributes={TextAttributes.BOLD}>
+            Tools
+          </text>
+          <For each={tools()}>
+            {(tool) => (
+              <text fg={theme.textMuted}>
+                {tool.name}: AI {formatNumber(tool.ai)} · Kept {formatNumber(tool.accepted)}
+              </text>
+            )}
+          </For>
+        </box>
+      </Show>
+      <box flexDirection="row" justifyContent="flex-end">
+        <box paddingLeft={3} paddingRight={3} backgroundColor={theme.primary} onMouseUp={() => dialog.clear()}>
+          <text fg={theme.selectedListItemText}>ok</text>
+        </box>
+      </box>
     </box>
   )
 }
